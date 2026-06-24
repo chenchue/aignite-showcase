@@ -1,79 +1,84 @@
-# LearnOS — Architecture & Design Decisions
+# Aignite: Architecture & Design Decisions
 
-This document explains *how* LearnOS is built and *why* the key choices were
-made. The code excerpts below are illustrative — chosen because they show a
-design decision, not because they're the hard part. The prompts, evaluation
-suites, and full implementation are not included (see
-[the repo note](README.md#whats-in-this-repo)).
+This document explains how Aignite is built and why the key choices were made. The code excerpts are illustrative: each one shows a decision, not necessarily the hard part of the system. The prompts, eval suites, and full implementation are not included (see [the repo note](README.md#whats-in-this-repo)).
 
-> **The one sentence the system proves:** it can *assess, teach, evaluate, and
-> decide what to teach next* — and resurface earlier material.
+> **The one sentence the system proves:** it can *assess, teach, evaluate, and decide what to teach next*, and resurface earlier material.
+
+**Contents**
+
+1. [Two agents, explicitly orchestrated](#1-two-agents-explicitly-orchestrated)
+2. [Mastery: track a float, decide on buckets](#2-mastery-track-a-float-decide-on-buckets)
+3. [The planner is real, just simple](#3-the-planner-is-real-just-simple)
+4. [Spaced review: a rule, not a library](#4-spaced-review-a-rule-not-a-library)
+5. [Privacy by construction](#5-privacy-by-construction)
+6. [LLM safety as a first-class threat model](#6-llm-safety-as-a-first-class-threat-model)
+7. [The reasoning is visible (SSE + decision log)](#7-the-reasoning-is-visible-sse--decision-log)
+8. [Storage behind interfaces](#8-storage-behind-interfaces)
+9. [The front-end](#9-the-front-end)
+10. [What was deliberately not built](#10-what-was-deliberately-not-built)
 
 ---
 
 ## 1. Two agents, explicitly orchestrated
 
-The intelligence is two cooperating LLM agents, not one prompt:
+The intelligence is two cooperating LLM agents, not one prompt.
 
-- **Tutor** — runs the inner loop for one concept at one depth level:
-  **Prime** (surface what the student already knows) → **Teach** (a minimal,
-  adapted explanation) → **Assess** (a *live-generated* question). Questions
-  are never stored in the course model; they're generated per turn and adapted
-  to the student's prior mistakes.
-- **Evaluator** — called by the Tutor *as a tool*. It scores a free-text answer
-  `0.0–1.0` and returns a structured result: one field per audience —
-  `feedback` (student-facing), `analysis` and `misconception` (for tutor
-  adaptation and the lecturer dashboard). Freeform strings, deliberately **no
-  error-type taxonomy**.
+- **Tutor** runs the inner loop for one concept at one depth level: **Prime** (surface what the student already knows), **Teach** (a minimal, adapted explanation), **Assess** (a live-generated question). Questions are never stored in the course model. They're generated per turn and adapted to the student's prior mistakes.
+- **Evaluator** is a separate agent the graph routes to after Assess (a distinct LLM, its own node and prompt). It scores a free-text answer from 0.0 to 1.0 and returns a structured result with one field per audience: `feedback` for the student, `analysis` and `misconception` for tutor adaptation and the lecturer dashboard. Freeform strings, with no error-type taxonomy.
 
-This is wired as a small **LangGraph** — enough to express the real two-agent
-handoff and tool use, and no more. A multi-subgraph framework would have been
-over-engineering for two agents; a bare `while` loop would have hidden the
-structure the design is *about*. The orchestration is scoped to match the
-actual agent structure.
+This is wired as a small **LangGraph** state machine: a node per phase, with explicit conditional edges for routing. The two agents are two nodes with a handoff between them, not a tool call. A bare `while` loop would have hidden the structure the design is about; a multi-subgraph framework would have been over-engineering for two agents.
+
+```python
+def _build_graph_builder() -> StateGraph:
+    builder = StateGraph(TutoringState)
+
+    builder.add_node("prime", prime_node)
+    builder.add_node("teach", teach_node)
+    builder.add_node("assess", assess_node)
+    builder.add_node("evaluate", evaluate_node)
+    builder.add_node("await_retry", await_retry_node)
+    builder.add_node("update_mastery", update_mastery_node)
+
+    builder.add_conditional_edges(START, route_entry, {"prime": "prime", "assess": "assess"})
+    builder.add_edge("prime", "teach")
+    builder.add_edge("teach", "assess")
+    builder.add_edge("assess", "evaluate")
+    builder.add_conditional_edges(
+        "evaluate", route_after_evaluate,
+        {"update_mastery": "update_mastery", "await_retry": "await_retry", END: END},
+    )
+    builder.add_edge("await_retry", "evaluate")
+    builder.add_edge("update_mastery", END)
+    return builder
+```
+
+Routing is data-driven (`route_entry`, `route_after_evaluate`), not a chain of `if`s buried in a node. A retrieve-only review skips Prime and Teach and enters at `assess`; a failed evaluation can route to `await_retry` instead of updating mastery.
 
 ## 2. Mastery: track a float, decide on buckets
 
-Mastery per concept *per depth level* is a single float, updated with an
-exponential moving average so recent performance dominates without erasing
-history:
+Mastery per concept *per depth level* is a single float, updated with an exponential moving average so recent performance dominates without erasing history. The bucket mapping and the EMA are two pure functions, defined once and reused everywhere (the live update, the analytics replay over attempt history, the seed script).
 
 ```python
-def update_mastery(overlay, concept_id, level, score, logger):
-    """EMA update: new = old*0.7 + score*0.3."""
-    level_mastery = overlay.concepts[concept_id].levels[level]
-    old_score = level_mastery.score
-    new_score = ema_update(old_score, score)   # old*0.7 + score*0.3
-    level_mastery.score = new_score
-    logger.log("mastery_updated", {
-        "concept": concept_id, "level": level.value,
-        "before": old_score, "after": new_score,
-        "raw_score": score, "bucket": level_mastery.bucket.value,
-    })
+def bucket_from_score(score: float) -> MasteryBucket:
+    if score > 0.7:
+        return MasteryBucket.SOLID
+    if score >= 0.4:
+        return MasteryBucket.SHAKY
+    return MasteryBucket.NOT_YET
+
+
+def ema_update(old: float, score: float) -> float:
+    """new = old*0.7 + score*0.3."""
+    return old * 0.7 + score * 0.3
 ```
 
-The float is stored, but **no decision is ever made on the raw float.** Every
-decision — unlock a concept, reteach vs. move on, prerequisite met, mastered? —
-reads a **coarse bucket**:
+The float is stored, but **no decision is ever made on the raw float.** Every decision (unlock a concept, reteach or move on, prerequisite met, mastered?) reads the coarse bucket.
 
-```
-score < 0.4   → not-yet
-0.4 – 0.7     → shaky
-score > 0.7   → solid
-```
-
-Why this matters: an LLM-graded score is noisy. Branching on `0.71 vs 0.69`
-would make the system jittery and unexplainable. Branching on three buckets
-makes every decision robust and easy to narrate to a student ("this is solid —
-let's go deeper") or a grader.
+Why it matters: an LLM-graded score is noisy. Branching on `0.71` vs `0.69` would make the system jittery and unexplainable. Branching on three buckets makes every decision stable and easy to narrate, to a student ("this is solid, let's go deeper") or to a grader.
 
 ## 3. The planner is real, just simple
 
-A study session is three kinds of work, in order: **RETRIEVE** (due reviews),
-**GO DEEP** (push a started concept to its next level), **NEW** (teach an
-unlocked concept from scratch). The planner is a flat graph-walk gated by
-mastery buckets and due-dates — a *real* planner, deliberately not a time-budget
-optimizer:
+A study session is three kinds of work, in order: **RETRIEVE** (due reviews), **DEEP** (push a started concept to its next level), **NEW** (teach an unlocked concept from scratch). The planner is a flat graph-walk gated by mastery buckets and due-dates. It's a real planner, deliberately not a time-budget optimizer.
 
 ```python
 def plan_session(course, overlay, strategy, logger, session_duration=30, now=None):
@@ -89,11 +94,7 @@ def plan_session(course, overlay, strategy, logger, session_duration=30, now=Non
     return plan
 ```
 
-Note `strategy` and `session_duration` are accepted, threaded, and **logged but
-unused**. They're a deliberate *seam*: the interface for per-strategy behavior
-exists and is wired (the log line proves it's connected), but the behavior
-behind it is intentionally not built yet. Simplicity lives in the body, never in
-the interface — so filling it in later changes nothing above it.
+`strategy` and `session_duration` are accepted, threaded, and **logged but unused**. They're a deliberate seam: the interface for per-strategy behaviour exists and is wired (the log line proves it's connected), but the behaviour behind it isn't built yet. Simplicity lives in the body, never in the interface, so filling it in later changes nothing above it.
 
 A prerequisite check is one bucket read:
 
@@ -107,38 +108,36 @@ def prerequisites_met(concept_id, course, overlay):
 
 ## 4. Spaced review: a rule, not a library
 
-Each depth level keeps its own review date and decays independently. The
-scheduler is a single rule — no FSRS, no SM-2, no dependency:
+Each depth level keeps its own review date and decays independently. The scheduler is a single rule: no FSRS, no SM-2, no dependency.
 
 ```python
-def schedule_review(level_mastery, passed, ...):
-    """pass -> interval x2, fail -> reset to 1 day."""
+def schedule_review(level_mastery, passed, logger, concept_id, level, now=None, student_id=None):
+    """pass -> interval x2, fail -> reset to 1 day. Mutates in place."""
+    now = now or datetime.now()
     if not passed:
-        new_interval = 1
+        new_interval = DEFAULT_INTERVAL_DAYS
     elif level_mastery.next_review is not None:
-        old = max((level_mastery.next_review - now).days, 1)
-        new_interval = old * 2
+        old_interval = max((level_mastery.next_review - now).days, DEFAULT_INTERVAL_DAYS)
+        new_interval = old_interval * 2
     else:
-        new_interval = 1
+        new_interval = DEFAULT_INTERVAL_DAYS
     level_mastery.next_review = now + timedelta(days=new_interval)
+    logger.log("review_scheduled", {
+        "concept": concept_id, "level": level.value,
+        "next_review": level_mastery.next_review.isoformat(),
+    }, student_id=student_id)
 ```
 
-A passed level isn't deleted — it becomes a *review* target. (For the demo,
-state is seeded so the RETRIEVE bucket is non-empty in a single sitting; the
-scheduler logic is unchanged.)
+A passed level isn't deleted, it becomes a review target. (For the demo, state is seeded so the RETRIEVE bucket is non-empty in a single sitting. The scheduler logic is unchanged; only the starting dates are pre-loaded.)
 
 ## 5. Privacy by construction
 
-The lecturer surface is **aggregates only** — and that's enforced structurally,
-not by a policy doc or a code-review rule. The lecturer's *only* read path is
-one interface whose method signatures can return counts, means, and
-distributions, but **never accept or return a student identity**. Individual
-rows are not "forbidden" — they're *inexpressible*:
+The lecturer surface is aggregates only, and that's enforced structurally, not by a policy doc or a code-review convention. The lecturer's *only* read path is one interface whose method signatures can return counts, means, and distributions, but never accept or return a student identity. Individual rows aren't forbidden; they're *inexpressible*.
 
 ```python
 class LecturerAnalyticsRepository(ABC):
     """The lecturer's only read path. Every method returns aggregate shapes
-    (counts, means, distributions) — no method accepts or returns a student
+    (counts, means, distributions): no method accepts or returns a student
     identity, so individual rows are inexpressible through this boundary.
     At scale, this is the slot where database-enforced access control lands
     (a lecturer DB role granted SELECT only on aggregate views)."""
@@ -155,14 +154,12 @@ class LecturerAnalyticsRepository(ABC):
     # ...all returns are aggregate shapes; no student_id anywhere
 ```
 
-The two cases that *need* text (clustering misconceptions, auditing weak
-questions) return identity-stripped, text-sorted dataclasses with **no student
-field** — so even those exceptions can't carry an identity:
+The two features that genuinely need text (clustering misconceptions, auditing weak questions) return identity-stripped, text-sorted dataclasses with no student field, so even those exceptions can't carry an identity.
 
 ```python
 @dataclass(frozen=True)
 class ActiveIssue:
-    """One student's current diagnosis at one concept — identity-stripped by
+    """One student's current diagnosis at one concept, identity-stripped by
     construction: the dataclass has no student field, so a student id cannot
     cross this boundary even by accident."""
     concept_id: str
@@ -171,70 +168,107 @@ class ActiveIssue:
     misconception: str | None
 ```
 
-Data minimization *is* the privacy position: there's no consent toggle because
-there's no individual data to consent about.
+In the implementation, `student_id` is read from the database to merge a student's diagnoses across depth levels, then dropped before anything is returned, and the results are sorted by text so row order carries no residual correlation to student ids. Data minimization *is* the privacy position: there's no consent toggle because there's no individual data to consent about.
 
 ## 6. LLM safety as a first-class threat model
 
-The insight suite reads text *derived from student answers* — a prompt-injection
-surface. The design treats generated text as tainted and stages the pipeline so
-the **LLM writes, but code counts, validates, and gates**:
+The insight suite reads text derived from student answers, which is a prompt-injection surface. The design treats generated text as tainted and stages the pipeline so the **LLM writes, but code counts, validates, and gates**.
 
-- the model proposes clusters and prose; **code** computes every count from
-  validated row ids — the model never controls a number a lecturer sees;
-- proposed lecture plans are validated against the prerequisite DAG and the time
-  budget *before* they render;
-- a deterministic **output gate** enforces length caps and verifies no generated
-  card smuggled out an identity (defense in depth — identities never enter an
-  LLM context in the first place);
-- class "kits" (intervention scripts) are **human-in-the-loop**: drafted, then
-  held until a lecturer explicitly approves — the system never contacts
-  students on its own.
+- The model proposes clusters and prose. **Code** computes every count from validated row ids, so the model never controls a number a lecturer sees.
+- Proposed lecture plans are validated against the prerequisite graph and the time budget *before* they render.
+- A deterministic **output gate** enforces length caps and verifies that no generated card smuggled out an identity. This is defense in depth: identities never enter an LLM context in the first place.
+- Class "kits" (intervention scripts) are **human-in-the-loop**. They're drafted, then held until a lecturer explicitly approves. The system never contacts students on its own.
 
-Behavior is pinned by **golden eval suites** (clustering counts, injection
-resistance via canary tokens, paraphrase enforcement, DAG-valid plans, grounded
-kits, evaluator null-discipline). Prompt changes are gated on these evals.
-*(The eval cases and prompts themselves are kept private.)*
+Behaviour is pinned by **golden eval suites**: clustering counts, injection resistance via canary tokens, paraphrase enforcement, DAG-valid plans, grounded kits, evaluator null-discipline. Prompt changes are gated on these evals. (The eval cases and prompts themselves are kept private.)
 
 ## 7. The reasoning is visible (SSE + decision log)
 
-The whole point is *adaptive decisions*, so every decision is inspectable. One
-centralized `logEvent(type, detail)` emits structured events at each decision
-point (`session_planned`, `concept_selected`, `assess`, `evaluated`,
-`mastery_updated`, `review_scheduled`, …). These stream to the client over
-**Server-Sent Events** *as they happen* — the tutoring API never pretends a
-multi-step agent is a single request/response call. The UI and a toggleable
-**dev-trace panel** update mid-turn.
+The whole point is *adaptive decisions*, so every decision is inspectable. One centralized event logger emits structured events at each decision point (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`). The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
 
-This one event stream does three jobs: it's how the adaptive flow is verified,
-how the system's reasoning is shown live in a demo, and the captured evidence
-for the writeup. Student-facing surfaces get friendly phrasing ("Let's quickly
-review Demand — it's been a while"); raw values (mastery floats, strategy codes)
-stay in the dev panel only.
+```python
+async def _stream_run(graph, run_input, config, thread_id):
+    """Run the graph to its next interrupt, yielding one step per node, then the state."""
+    async for chunk in graph.astream(run_input, config, stream_mode="updates"):
+        for node, update in chunk.items():
+            if node.startswith("__"):       # interrupt markers, not real nodes
+                continue
+            yield "step", _format_step(node, update)
+    snapshot = await graph.aget_state(config)
+    yield "state", _format_response(snapshot.values, thread_id)
+```
+
+The tutoring API never pretends a multi-step agent is one request/response call. The UI and a toggleable **dev-trace panel** update mid-turn. This one event stream does three jobs: it's how the adaptive flow is verified, how the system's reasoning is shown live in a demo, and the captured evidence for the writeup. Student-facing surfaces get friendly phrasing ("Let's quickly review Demand, it's been a while"); raw values (mastery floats, strategy codes) stay in the dev panel only.
 
 ## 8. Storage behind interfaces
 
-All storage sits behind **repository interfaces** — the logic depends on
-`MasteryRepository`, never on a concrete store. Today that's one SQLite database
-via SQLAlchemy (plus a static `course.json` and a durable LangGraph
-checkpointer). Swapping to Postgres later is a connection string, not a
-redesign. Students are keyed by integer id; identity always comes from the JWT
-(`get_current_student`), never from a client-supplied name or id.
+All storage sits behind **repository interfaces**. The logic depends on `MasteryRepository`, never on a concrete store.
 
-## 9. What was deliberately *not* built
+```python
+class MasteryRepository(ABC):
+    @abstractmethod
+    def get(self, student_id: int) -> MasteryOverlay | None: ...
 
-Scope discipline was an explicit design goal — over-engineering to look
-impressive is itself a judgment failure. Chosen *against*, on purpose:
+    @abstractmethod
+    def save(self, overlay: MasteryOverlay) -> None: ...
+
+    @abstractmethod
+    def init_fresh(self, student_id: int, concept_ids: list[str]) -> MasteryOverlay: ...
+```
+
+Today the concrete store is one SQLite database via SQLAlchemy (plus a static `course.json` and a durable LangGraph checkpointer). The session factory is injected, so tests instantiate their own against a temp file. Swapping to Postgres later is a connection string, not a redesign. Students are keyed by integer id, and identity always comes from the JWT (`get_current_student`), never from a client-supplied name or id.
+
+## 9. The front-end
+
+A React + TypeScript app (Vite, [@xyflow/react](https://reactflow.dev/) for the concept map). Two parts are worth calling out.
+
+**Consuming the decision stream.** `EventSource` only supports GET, so the client reads the `text/event-stream` body itself: a reader loop, a buffer split on `\n\n`, and typed dispatch. Each `step` frame updates the UI live; the final `state` frame resolves the turn.
+
+```typescript
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  let sep;
+  while ((sep = buffer.indexOf("\n\n")) !== -1) {
+    const frame = buffer.slice(0, sep);
+    buffer = buffer.slice(sep + 2);
+    handleFrame(frame); // event: "step" → onStep(...) ; event: "state" → finalState
+  }
+}
+```
+
+The domain is modelled with explicit string-literal unions rather than loose strings, so an impossible bucket or phase is a compile error:
+
+```typescript
+export type MasteryState = "not_started" | "shaky" | "solid";
+export type DepthLevelKey = "know" | "apply" | "transfer";
+
+export interface MapNode {
+  id: string;
+  title: string;
+  mastery: MasteryState;
+  locked: boolean;
+  levels: Record<DepthLevelKey, LevelBucket>;
+}
+```
+
+**Rendering the map.** The concept map is one component reused at two sizes (a side peek and the full interactive view). Fitting the graph to its container reliably means coordinating the order in which React Flow initializes, the flex layout settles, and the data updates: the fit is deferred and re-triggered by whichever signal lands last (nodes measured, container resized, init), so the view stays correct at any size.
+
+## 10. What was deliberately not built
+
+Scope discipline was an explicit design goal. Over-engineering to look impressive is itself a judgment failure. Chosen against, on purpose:
 
 | Not built | Why |
 |---|---|
 | RAG / vector store | The whole source text fits in the prompt. |
-| FSRS / SM-2 spaced repetition | `pass→×2 / fail→1-day` is enough for the MVP. |
-| Error-type taxonomy | `analysis`/`misconception` stay freeform strings. |
-| BKT mastery | EMA + coarse buckets is sufficient and explainable. |
-| Per-strategy session behavior | Wired as an inert seam; behavior deferred. |
+| FSRS / SM-2 spaced repetition | `pass → ×2 / fail → 1-day` is enough for the MVP. |
+| Error-type taxonomy | `analysis` / `misconception` stay freeform strings. |
+| BKT mastery | EMA plus coarse buckets is sufficient and explainable. |
+| Per-strategy session behaviour | Wired as an inert seam; behaviour deferred. |
 | Multi-model evaluator consensus | One Evaluator, prompt iterated instead. |
 
-Each of these *exists as a seam* where the demo path needs the boundary, with a
-trivial body — so the architecture stays honest now and upgrades stay clean
-later.
+Each of these exists as a seam where the demo path needs the boundary, with a trivial body, so the architecture stays honest now and upgrades stay clean later.
