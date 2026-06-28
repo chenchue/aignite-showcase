@@ -183,7 +183,7 @@ Behaviour is pinned by **golden eval suites**: clustering counts, injection resi
 
 ## 7. The reasoning is visible (SSE + decision log)
 
-The whole point is *adaptive decisions*, so every decision is inspectable. One centralized event logger emits structured events at each decision point (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`). The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
+The whole point is *adaptive decisions*, so I instrumented every decision to be inspectable, for building and demoing the system rather than as a student-facing feature. One centralized event logger emits structured events at each decision point (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`). The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
 
 ```python
 async def _stream_run(graph, run_input, config, thread_id):
@@ -264,7 +264,7 @@ Scope discipline was an explicit design goal. Over-engineering to look impressiv
 
 | Not built | Why |
 |---|---|
-| RAG / vector store | The whole source text fits in the prompt. |
+| RAG / vector store | This single demo subject fits in one prompt; a multi-subject corpus at scale is where retrieval returns. |
 | FSRS / SM-2 spaced repetition | `pass → ×2 / fail → 1-day` is enough for the MVP. |
 | Error-type taxonomy | `analysis` / `misconception` stay freeform strings. |
 | BKT mastery | EMA plus coarse buckets is sufficient and explainable. |
