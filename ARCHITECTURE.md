@@ -9,15 +9,17 @@ This document explains how Aignite is built and why the key choices were made. T
 - [System overview](#system-overview)
 
 1. [Two agents, explicitly orchestrated](#1-two-agents-explicitly-orchestrated)
-2. [Mastery: track a float, decide on buckets](#2-mastery-track-a-float-decide-on-buckets)
-3. [The planner is real, just simple](#3-the-planner-is-real-just-simple)
-4. [Spaced review: a rule, not a library](#4-spaced-review-a-rule-not-a-library)
-5. [Privacy by construction](#5-privacy-by-construction)
-6. [LLM safety as a first-class threat model](#6-llm-safety-as-a-first-class-threat-model)
-7. [The reasoning is visible (SSE + decision log)](#7-the-reasoning-is-visible-sse--decision-log)
-8. [Storage behind interfaces](#8-storage-behind-interfaces)
-9. [The front-end](#9-the-front-end)
-10. [What was deliberately not built](#10-what-was-deliberately-not-built)
+2. [Durable, resumable turns](#2-durable-resumable-turns)
+3. [Mastery: track a float, decide on buckets](#3-mastery-track-a-float-decide-on-buckets)
+4. [The planner is real, just simple](#4-the-planner-is-real-just-simple)
+5. [Spaced review: a rule, not a library](#5-spaced-review-a-rule-not-a-library)
+6. [Privacy by construction](#6-privacy-by-construction)
+7. [LLM safety as a first-class threat model](#7-llm-safety-as-a-first-class-threat-model)
+8. [The evaluation harness](#8-the-evaluation-harness)
+9. [The reasoning is visible (SSE + decision log)](#9-the-reasoning-is-visible-sse--decision-log)
+10. [Storage behind interfaces](#10-storage-behind-interfaces)
+11. [The front-end](#11-the-front-end)
+12. [Out of MVP scope (deferred by design)](#12-out-of-mvp-scope-deferred-by-design)
 
 ---
 
@@ -91,7 +93,30 @@ def _build_graph_builder() -> StateGraph:
 
 Routing is data-driven (`route_entry`, `route_after_evaluate`), not a chain of `if`s buried in a node. A retrieve-only review skips Prime and Teach and enters at `assess`; a failed evaluation can route to `await_retry` instead of updating mastery.
 
-## 2. Mastery: track a float, decide on buckets
+**Structured output is a gate, not a hint.** The Evaluator returns a Pydantic model whose `score` is bound to `[0.0, 1.0]`. An out-of-range or malformed result is *rejected and retried*, never clamped into range, so a broken verdict can't quietly become a real grade. The graph also handles a quieter LangChain failure mode: the function-calling parser behind structured output can return `None` instead of raising when the model skips the tool call, so that case is converted into the same retry path. And after a bounded number of failed rounds the turn ends cleanly without touching mastery at all: `route_after_evaluate` can send a failed evaluation to `await_retry` or to a terminal end, but never to `update_mastery`. The loop fails safe, not silent.
+
+**Adaptation is a closed loop, per level.** This is where "adaptive" is actually implemented. When the Evaluator scores an answer it also emits a diagnosis: an `analysis` (the gap) and, only when there's an evident wrong belief, a `misconception`. On a fail those are stored on that concept *at that depth level*, and the next `teach` and `assess` are rebuilt from them, with a misconception handled differently from a gap (the prompt is told to confront and correct a wrong belief, not merely restate the answer). Both are cleared on a pass, so a later review failure at one level never clobbers the active level's context. The loop from evaluator diagnosis, to per-level stored state, to the next prompt is the real adaptation mechanism, not a tone.
+
+## 2. Durable, resumable turns
+
+A tutoring turn is not one request: it has to stop in the middle and wait for a human. After the tutor asks a question, the graph must suspend until the student types an answer, which might arrive in seconds or after a page reload. Aignite models this with LangGraph's node-boundary interrupts over a durable SQLite checkpointer, so a turn survives a stateless HTTP boundary and even a server restart.
+
+```python
+_INTERRUPT_AFTER = ["prime", "assess", "await_retry"]
+
+def build_tutoring_graph(checkpointer):
+    """Build and return the compiled tutoring graph with the given checkpointer."""
+    return _build_graph_builder().compile(
+        checkpointer=checkpointer,
+        interrupt_after=_INTERRUPT_AFTER,
+    )
+```
+
+The graph runs to its next interrupt and stops; the client holds only an opaque thread id. The next request rehydrates the full `TutoringState` from the checkpoint, injects the student's input at the phase the state says it is waiting on, and continues from exactly there. There is no in-memory session map to lose on a restart: durability *is* the checkpointer.
+
+Ownership rides on the same mechanism. A session is just a checkpoint thread, so authorization compares the JWT's student id against the `student_id` baked into the checkpointed state: a missing thread is a 404, someone else's thread is a 403, and a guessed session id reads nothing. Identity comes from the token, never from the path. The production graph and the LangGraph Studio graph share one builder and differ only in which checkpointer is injected.
+
+## 3. Mastery: track a float, decide on buckets
 
 Mastery per concept *per depth level* is a single float, updated with an exponential moving average so recent performance dominates without erasing history. The bucket mapping and the EMA are two pure functions, defined once and reused everywhere (the live update, the analytics replay over attempt history, the seed script).
 
@@ -113,7 +138,9 @@ The float is stored, but **no decision is ever made on the raw float.** Every de
 
 Why it matters: an LLM-graded score is noisy. Branching on `0.71` vs `0.69` would make the system jittery and unexplainable. Branching on three buckets makes every decision stable and easy to narrate, to a student ("this is solid, let's go deeper") or to a grader.
 
-## 3. The planner is real, just simple
+**Derive, don't store.** Because the EMA and bucket rule are pure and the attempt log is append-only, a question like "has this student ever reached solid here?" is answered by *replaying* the real EMA over their attempts, not by maintaining a separate high-water-mark column that could drift out of sync. The same single definition of mastery runs in the live tutor, the analytics replay, the demo seed, and the tests, so none of them can disagree about what a score means.
+
+## 4. The planner is real, just simple
 
 A study session is three kinds of work, in order: **RETRIEVE** (due reviews), **DEEP** (push a started concept to its next level), **NEW** (teach an unlocked concept from scratch). The planner is a flat graph-walk gated by mastery buckets and due-dates. It's a real planner, deliberately not a time-budget optimizer.
 
@@ -143,7 +170,7 @@ def prerequisites_met(concept_id, course, overlay):
     return True
 ```
 
-## 4. Spaced review: a rule, not a library
+## 5. Spaced review: a rule, not a library
 
 Each depth level keeps its own score and review date and is scheduled independently. The scheduler is a single rule: no FSRS, no SM-2, no dependency.
 
@@ -165,9 +192,9 @@ def schedule_review(level_mastery, passed, logger, concept_id, level, now=None, 
     }, student_id=student_id)
 ```
 
-A passed level isn't deleted, it becomes a review target. (For the demo, state is seeded so the RETRIEVE bucket is non-empty in a single sitting. The scheduler logic is unchanged; only the starting dates are pre-loaded.)
+A passed level isn't deleted, it becomes a review target. `now` is an injected parameter, which is what lets the demo seed drive this exact code with historical timestamps to make the RETRIEVE bucket non-empty in a single sitting. The scheduler logic is unchanged; only the starting dates are pre-loaded.
 
-## 5. Privacy by construction
+## 6. Privacy by construction
 
 The lecturer surface is aggregates only, and that's enforced structurally, not by a policy doc or a code-review convention. The lecturer's *only* read path is one interface whose method signatures can return counts, means, and distributions, but never accept or return a student identity. Individual rows aren't forbidden; they're *inexpressible*.
 
@@ -205,20 +232,83 @@ class ActiveIssue:
     misconception: str | None
 ```
 
-In the implementation, `student_id` is read from the database to merge a student's diagnoses across depth levels, then dropped before anything is returned, and the results are sorted by text so row order carries no residual correlation to student ids. Data minimization *is* the privacy position: there's no consent toggle because there's no individual data to consent about.
+In the implementation, `student_id` is read from the database to merge a student's diagnoses across depth levels, then dropped before anything is returned, and the results are sorted by text so row order carries no residual correlation to student ids. The question-audit exception is the same shape and additionally omits the student's answer column outright. An identity can't leak from an LLM context because it is never placed in one; the output gate's name and email check (section 7) is defense in depth against a *fabricated* identity, not a load-bearing scrubber. Data minimization *is* the privacy position: there's no consent toggle because there's no individual data to consent about.
 
-## 6. LLM safety as a first-class threat model
+## 7. LLM safety as a first-class threat model
 
-The insight suite reads text derived from student answers, which is a prompt-injection surface. The design treats generated text as tainted and stages the pipeline so the **LLM writes, but code counts, validates, and gates**.
+The insight suite turns text derived from student answers into lecturer-facing cards, which is a prompt-injection surface. There is a written taint model (`docs/design/llm-threat-model.md`): student answers are untrusted, and the evaluator's `analysis` / `misconception` are *second-order tainted* because they're shaped by student text, so every downstream stage treats them as attacker-influenceable. The governing rule is **the LLM writes, but code counts, validates, and gates**, and the guardrails are deterministic, so no LLM is ever asked to judge another LLM's output on this path.
 
-- The model proposes clusters and prose. **Code** computes every count from validated row ids, so the model never controls a number a lecturer sees.
-- Proposed lecture plans are validated against the prerequisite graph and the time budget *before* they render.
-- A deterministic **output gate** enforces length caps and verifies that no generated card smuggled out an identity. This is defense in depth: identities never enter an LLM context in the first place.
-- Class "kits" (intervention scripts) are **human-in-the-loop**. They're drafted, then held until a lecturer explicitly approves. The system never contacts students on its own.
+**Symmetric gates, both deterministic.** A tainted row is filtered on the way in, and every generated field is checked on the way out.
 
-Behaviour is pinned by **golden eval suites**: clustering counts, injection resistance via canary tokens, paraphrase enforcement, DAG-valid plans, grounded kits, evaluator null-discipline. Prompt changes are gated on these evals. (The eval cases and prompts themselves are kept private.)
+- The **input gate** drops rows whose text matches known injection phrasings before they ever reach the model's context. The patterns are deliberately narrow full-phrase regexes to keep false positives near zero, and the database row is kept for audit: only the model's *view* is filtered.
+- The **output gate** is pure string checking with three rules: an identity-leak check (enrolled names by word boundary, emails by substring), a verbatim-copy check (any shared run of 8 words with a source row is treated as a quote, mechanically enforcing paraphrase-only), and a per-field length cap. On a violation the caller drops the card and logs the rule name only, never the content.
 
-## 7. The reasoning is visible (SSE + decision log)
+```python
+VERBATIM_NGRAM = 8   # 8+ identical words in a row is copying, not summarizing
+
+def find_violation(text, *, blocklist=(), source_texts=(), max_length=MAX_FIELD_LENGTH):
+    """Returns the violated rule name, or None. Pure string checking, no LLM."""
+    if len(text) > max_length:
+        return "too_long"
+    lowered = text.lower()
+    for term in blocklist:                       # the roster: names and emails
+        term = term.strip().lower()
+        if not term:
+            continue
+        if "@" in term:                          # email: substring match
+            if term in lowered:
+                return "identity_leak"
+        elif re.search(rf"\b{re.escape(term)}\b", lowered):   # name: word boundary
+            return "identity_leak"
+    text_grams = _ngrams(_words(text), VERBATIM_NGRAM)
+    if text_grams:
+        for source in source_texts:              # the raw rows this field came from
+            if text_grams & _ngrams(_words(source), VERBATIM_NGRAM):
+                return "verbatim_input"
+    return None
+```
+
+**The model never owns a number.** For each cluster the LLM returns only row ids; code validates each id (it must exist and belong to the cluster's concept), enforces kind purity (a misconception cluster only counts rows that actually hold a misconception), and then sets `student_count = len(valid distinct ids)`. A fabricated or foreign id is silently dropped, and because the ids are assigned `r0, r1, ...` over a deterministic concept-then-text ordering, they carry no information about students or insertion order. Lecture plans get the same treatment: a proposed plan is validated against the prerequisite DAG and the per-session time budget *before* it renders, and an invalid plan is sent back to the model with the exact violations appended for one corrective retry, then refused rather than served if it still fails.
+
+**Idempotent, version-salted synthesis.** A whole synthesis run is cached on a fingerprint: a SHA-256 of the canonical JSON of every input, salted with a `PROMPT_VERSION`. Identical inputs serve the stored run for free; any input change, or a prompt or schema bump, invalidates it. Bumping the version is the deliberate, auditable cache-bust, so there's no force-refresh button to misuse.
+
+```python
+def fingerprint(payload) -> str:
+    """SHA-256 of the canonical JSON of every synthesis input, salted with
+    PROMPT_VERSION. Equal hash means nothing the LLM would see has changed."""
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256((PROMPT_VERSION + "\n" + canon).encode()).hexdigest()
+```
+
+**Humans stay in the loop for anything that reaches a student.** Class "kits" (intervention scripts) are drafted and then held until a lecturer explicitly approves or edits them. The transition is one-way and one-time (a second decision is a 409), and the system never contacts students on its own. Regeneration is rate-limited two ways (a per-concept cooldown and a per-lecturer daily ceiling), both checked before the model is called, so a throttled request never spends tokens. These guardrails are pinned by the eval harness (section 8).
+
+## 8. The evaluation harness
+
+Prompts are the part of an LLM system most likely to silently regress, so behaviour is pinned by golden eval suites. Two properties are worth calling out.
+
+**Graded by production code, not by another model.** Every case is graded by the *same* functions the API runs: cluster counts from the real card builder, paraphrase from the real output gate, plan validity from the real validator, injection resistance from a canary check, groundedness from anchor terms that only exist in the course text. There's no LLM-as-judge to drift, and the eval can't disagree with production because it *is* production. A fuzzy metric would have to be calibrated against hand labels before it could be counted, so fuzzy metrics aren't used as gates.
+
+**Diffed against a committed baseline.** Results reduce to a `{suite: {case: passed}}` table and are compared against a checked-in last-known-good, so a prompt change reports exactly which cases regressed and which it fixed, not just a pass count. Updating the baseline is an explicit, deliberate human step.
+
+```python
+def diff_against_baseline(results, path=BASELINE_PATH):
+    """(regressed, fixed) vs the committed last-known-good."""
+    baseline = json.loads(path.read_text())["results"]
+    current = to_dict(results)
+    regressed, fixed = [], []
+    for suite, cases in current.items():
+        for name, passed in cases.items():
+            was = baseline.get(suite, {}).get(name)
+            if was is True and not passed:
+                regressed.append(f"{suite}/{name}")
+            if was is False and passed:
+                fixed.append(f"{suite}/{name}")
+    return regressed, fixed
+```
+
+The deterministic core (counting, validation, gating, scheduling, mastery) is covered by an offline `pytest` suite that stubs the LLM with a fake that mimics the structured-output interface and replays canned results, so the security-critical paths (a failed evaluation never fabricates a score or touches mastery) are tested with no network and no flakiness. The live-LLM evals run separately and skip themselves without an API key.
+
+## 9. The reasoning is visible (SSE + decision log)
 
 The whole point is *adaptive decisions*, so I instrumented every decision to be inspectable, for building and demoing the system rather than as a student-facing feature. Every decision on the path emits a structured event (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`): planner, selection, mastery, and review events go through a durable event logger, while the in-graph steps (`assess`, `evaluated`) are emitted as the graph runs. The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
 
@@ -236,7 +326,7 @@ async def _stream_run(graph, run_input, config, thread_id):
 
 The tutoring API never pretends a multi-step agent is one request/response call. The UI and a toggleable **dev-trace panel** update mid-turn. This one event stream does three jobs: it's how the adaptive flow is verified, how the system's reasoning is shown live in a demo, and the captured evidence for the writeup. Student-facing surfaces get friendly phrasing ("Let's quickly review Demand, it's been a while"); raw values (mastery floats, strategy codes) stay in the dev panel only.
 
-## 8. Storage behind interfaces
+## 10. Storage behind interfaces
 
 All storage sits behind **repository interfaces**. The logic depends on `MasteryRepository`, never on a concrete store.
 
@@ -254,7 +344,9 @@ class MasteryRepository(ABC):
 
 Today the concrete store is one SQLite database via SQLAlchemy (plus a static `course.json` and a durable LangGraph checkpointer). The session factory is injected, so tests instantiate their own against a temp file. Swapping to Postgres later is a connection string, not a redesign. Students are keyed by integer id, and identity always comes from the JWT (`get_current_student`), never from a client-supplied name or id.
 
-## 9. The front-end
+The same discipline runs through the services: mastery, scheduling, and every lecturer metric are pure functions with `now` injected and no I/O. That's what lets the demo seed drive the real scheduler with historical timestamps, and the tests pin time-dependent behaviour deterministically, without a parallel reimplementation of the logic they check.
+
+## 11. The front-end
 
 A React + TypeScript app (Vite, [@xyflow/react](https://reactflow.dev/) for the concept map). Two parts are worth calling out.
 
@@ -299,17 +391,17 @@ export interface MapNode {
 
 **Rendering the map.** The concept map is one component reused at two sizes (a side peek and the full interactive view). Fitting the graph to its container reliably means coordinating the order in which React Flow initializes, the flex layout settles, and the data updates: the fit is deferred and re-triggered by whichever signal lands last (nodes measured, container resized, init), so the view stays correct at any size.
 
-## 10. What was deliberately not built
+## 12. Out of MVP scope (deferred by design)
 
-Scope discipline was an explicit design goal. Over-engineering to look impressive is itself a judgment failure. Chosen against, on purpose:
+Scope discipline was itself a design goal. The MVP proves the adaptive loop end to end, and everything off that critical path was consciously deferred, each behind a seam so it drops in without disturbing the layers above. Deferring these was a judgment call, not a wall reached: over-engineering to look impressive would have been the real failure.
 
-| Not built | Why |
-|---|---|
-| RAG / vector store | This single demo subject fits in one prompt; a multi-subject corpus at scale is where retrieval returns. |
-| FSRS / SM-2 spaced repetition | `pass → ×2 / fail → 1-day` is enough for the MVP. |
-| Error-type taxonomy | `analysis` / `misconception` stay freeform strings. |
-| BKT mastery | EMA plus coarse buckets is sufficient and explainable. |
-| Per-strategy session behaviour | Wired as an inert seam; behaviour deferred. |
-| Multi-model evaluator consensus | One Evaluator, prompt iterated instead. |
+| Deferred | Why it's out of the MVP | How it drops in later |
+|---|---|---|
+| RAG / vector store | One demo subject fits in a single prompt, so retrieval would add latency and failure modes for no recall benefit yet. | A multi-subject corpus is where a retrieval layer slots in behind the existing course-source boundary. |
+| FSRS / SM-2 scheduling | `pass → ×2 / fail → 1-day` is enough to demonstrate resurfacing and stays easy to reason about and debug. | The scheduler is one function with an injected clock; a real interval model replaces its body and nothing else. |
+| Error-type taxonomy | Freeform `analysis` / `misconception` strings carry the signal the tutor and lecturer need without a premature schema. | The fields already exist; a classifier would annotate them without changing producers or consumers. |
+| BKT / richer mastery | EMA over coarse buckets is explainable and stable against noisy LLM scores. | Mastery sits behind `MasteryRepository`; a Bayesian model replaces the update rule alone. |
+| Per-strategy session behaviour | The strategy is wired end to end and logged, but branching on it is deferred so the planner stays one readable rule. | The seam is already live; per-mode weighting fills the body that is intentionally inert today. |
+| Multi-model evaluator consensus | One Evaluator with an iterated prompt, pinned by evals, is accurate enough for the MVP. | The evaluate node is one graph node; a consensus panel becomes a fan-out behind the same handoff. |
 
-Each of these exists as a seam where the demo path needs the boundary, with a trivial body, so the architecture stays honest now and upgrades stay clean later.
+Each row is a boundary chosen on purpose, with the interface already in place. Filling any of them in means replacing a body, with nothing above it changing.
