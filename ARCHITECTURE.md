@@ -6,6 +6,8 @@ This document explains how Aignite is built and why the key choices were made. T
 
 **Contents**
 
+- [System overview](#system-overview)
+
 1. [Two agents, explicitly orchestrated](#1-two-agents-explicitly-orchestrated)
 2. [Mastery: track a float, decide on buckets](#2-mastery-track-a-float-decide-on-buckets)
 3. [The planner is real, just simple](#3-the-planner-is-real-just-simple)
@@ -19,12 +21,47 @@ This document explains how Aignite is built and why the key choices were made. T
 
 ---
 
+## System overview
+
+Aignite is layered: a React client; a FastAPI edge that authenticates with a JWT cookie and streams agent steps over SSE; a LangGraph state machine that holds the two-agent tutoring loop; a set of pure-logic services (planner, scheduler, mastery updater) that decide on buckets; and repository interfaces over SQLite. Each layer depends only on the interface beneath it, so the store, the model, and the UI can each change without disturbing the others.
+
+```
+  React + TypeScript  (Vite, React Flow)
+    concept map · tutoring view · dev-trace panel
+        │   fetch + ReadableStream reader
+        │   ◄──  text/event-stream: one frame per agent step, then a final state frame
+        ▼
+  FastAPI edge   ·   JWT in httpOnly cookie   ·   get_current_student / require_lecturer
+        │
+        ├─ tutoring ─►  LangGraph state machine  (durable SQLite checkpointer)
+        │                 prime ─► teach ─► assess ─► evaluate ─┬─► update_mastery ─► END
+        │                                    ▲                  └─► await_retry ──────┘
+        │                              route_entry          route_after_evaluate
+        │
+        ├─ services ─►  planner · scheduler · mastery updater   (pure functions, decide on buckets)
+        │
+        └─ lecturer ─►  LecturerAnalyticsRepository (aggregates only)
+                          └─ insight suite: the LLM writes, code counts / validates / gates
+        │
+        ▼
+  Repository interfaces ─►  SQLite (SQLAlchemy)  +  course.json  +  durable checkpoints
+```
+
+### How one tutoring turn flows
+
+1. The student opens a concept, or accepts the planned queue. The client POSTs to the tutoring endpoint and immediately begins reading a `text/event-stream` response.
+2. FastAPI resumes the LangGraph run for that student's thread from its durable checkpoint. `route_entry` enters at `prime` for a new concept, or jumps straight to `assess` for a retrieve-only review.
+3. The Tutor nodes run: **prime** (surface what the student already knows), **teach** (a short, adapted explanation), **assess** (a question generated live). Each node completes as one streamed `step` frame, so the UI and the dev-trace panel update mid-turn rather than only at the end.
+4. The student answers. The graph routes to **evaluate**, a separate agent that scores the free-text answer and returns `{score, feedback, analysis, misconception}`.
+5. `route_after_evaluate` branches on the result: a pass goes to **update_mastery** (EMA update, recompute the bucket, schedule the next review); a fail with retries left goes to **await_retry**; an exhausted retry ends the turn.
+6. The final graph state is sent as one `state` frame. The client applies it: mastery moves, newly unlocked concepts light up on the map, and the next session's buckets are recomputed.
+
 ## 1. Two agents, explicitly orchestrated
 
 The intelligence is two cooperating LLM agents, not one prompt.
 
 - **Tutor** runs the inner loop for one concept at one depth level: **Prime** (surface what the student already knows), **Teach** (a minimal, adapted explanation), **Assess** (a live-generated question). Questions are never stored in the course model. They're generated per turn and adapted to the student's prior mistakes.
-- **Evaluator** is a separate agent the graph routes to after Assess (a distinct LLM, its own node and prompt). It scores a free-text answer from 0.0 to 1.0 and returns a structured result with one field per audience: `feedback` for the student, `analysis` and `misconception` for tutor adaptation and the lecturer dashboard. Freeform strings, with no error-type taxonomy.
+- **Evaluator** is a separate agent the graph routes to after Assess (its own graph node and prompt, run at a lower temperature and bound to a structured-output schema; it shares a base model with the Tutor but is a distinct agent). It scores a free-text answer from 0.0 to 1.0 and returns a structured result with one field per audience: `feedback` for the student, `analysis` and `misconception` for tutor adaptation and the lecturer dashboard. Freeform strings, with no error-type taxonomy.
 
 This is wired as a small **LangGraph** state machine: a node per phase, with explicit conditional edges for routing. The two agents are two nodes with a handoff between them, not a tool call. A bare `while` loop would have hidden the structure the design is about; a multi-subgraph framework would have been over-engineering for two agents.
 
@@ -108,7 +145,7 @@ def prerequisites_met(concept_id, course, overlay):
 
 ## 4. Spaced review: a rule, not a library
 
-Each depth level keeps its own review date and decays independently. The scheduler is a single rule: no FSRS, no SM-2, no dependency.
+Each depth level keeps its own score and review date and is scheduled independently. The scheduler is a single rule: no FSRS, no SM-2, no dependency.
 
 ```python
 def schedule_review(level_mastery, passed, logger, concept_id, level, now=None, student_id=None):
@@ -183,7 +220,7 @@ Behaviour is pinned by **golden eval suites**: clustering counts, injection resi
 
 ## 7. The reasoning is visible (SSE + decision log)
 
-The whole point is *adaptive decisions*, so I instrumented every decision to be inspectable, for building and demoing the system rather than as a student-facing feature. One centralized event logger emits structured events at each decision point (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`). The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
+The whole point is *adaptive decisions*, so I instrumented every decision to be inspectable, for building and demoing the system rather than as a student-facing feature. Every decision on the path emits a structured event (`session_planned`, `concept_selected`, `assess`, `evaluated`, `mastery_updated`, `review_scheduled`): planner, selection, mastery, and review events go through a durable event logger, while the in-graph steps (`assess`, `evaluated`) are emitted as the graph runs. The graph is run with LangGraph's streaming API, which yields one event per node as it completes, and the FastAPI endpoint relays those over **Server-Sent Events**.
 
 ```python
 async def _stream_run(graph, run_input, config, thread_id):
@@ -244,7 +281,10 @@ for (;;) {
 The domain is modelled with explicit string-literal unions rather than loose strings, so an impossible bucket or phase is a compile error:
 
 ```typescript
+// node-level state ("not_started") and per-level bucket ("not_yet") are
+// deliberately different unions, so the two can't be mixed up by accident.
 export type MasteryState = "not_started" | "shaky" | "solid";
+export type LevelBucket = "not_yet" | "shaky" | "solid";
 export type DepthLevelKey = "know" | "apply" | "transfer";
 
 export interface MapNode {
@@ -252,6 +292,7 @@ export interface MapNode {
   title: string;
   mastery: MasteryState;
   locked: boolean;
+  depth_reached: number;
   levels: Record<DepthLevelKey, LevelBucket>;
 }
 ```

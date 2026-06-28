@@ -34,7 +34,7 @@ The dark panel in the clip is a **dev-trace panel**, an inspector that streams t
 
 ## Engineering highlights
 
-- **Two cooperating agents, explicitly orchestrated.** A **Tutor** agent runs the Prime → Teach → Assess loop, then hands the answer to a separate **Evaluator** agent that scores it. They're two distinct LLMs wired as nodes in a small [LangGraph](https://github.com/langchain-ai/langgraph) state machine, with explicit conditional routing. A bare `while` loop would have hidden the structure the design is about; a multi-subgraph framework would have been over-engineering for two agents.
+- **Two cooperating agents, explicitly orchestrated.** A **Tutor** agent runs the Prime → Teach → Assess loop, then hands the answer to a separate **Evaluator** agent that scores it. They're two separate agents (their own prompts, temperatures, and output schemas, on a shared base model) wired as nodes in a small [LangGraph](https://github.com/langchain-ai/langgraph) state machine, with explicit conditional routing. A bare `while` loop would have hidden the structure the design is about; a multi-subgraph framework would have been over-engineering for two agents.
 - **Decisions run on coarse buckets, not raw floats.** Mastery is a float, updated with an exponential moving average, but every *decision* (unlock a concept, reteach or move on, prerequisite met, mastered?) reads one of three buckets: `not-yet`, `shaky`, `solid`. An LLM-graded score is noisy; branching on `0.71` vs `0.69` would make the system jittery for no real signal. Three buckets keep every decision stable and easy to narrate.
 - **Instrumented so the adaptive logic is inspectable.** Every decision emits a structured event (concept selected, answer evaluated, mastery updated), streamed to the client over **Server-Sent Events** as the agent works, so the tutoring API never collapses a multi-step agent into one request/response call. That instrumentation drives the dev-trace panel I used to verify and demo the system; in normal use it's hidden, not student-facing.
 - **Privacy by construction.** The lecturer's only data path is one interface whose method signatures return counts, means, and distributions, and never a student identity. The two features that need text return a dataclass with no student field, so an identity can't cross the boundary even by accident. [See how.](ARCHITECTURE.md#5-privacy-by-construction)
@@ -69,61 +69,6 @@ The dark panel in the clip is a **dev-trace panel**, an inspector that streams t
 ```
 
 Full design reasoning lives in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
-
-## A look at the code
-
-The full source is private, so here are a few excerpts that show the house style.
-
-**Front-end: consuming the agent's decision stream over SSE.** `EventSource` only does GET, so the client reads `text/event-stream` itself, buffering and splitting on frame boundaries so the UI updates on every agent step while the final state resolves at the end of the turn.
-
-```typescript
-const reader = res.body.getReader();
-const decoder = new TextDecoder();
-let buffer = "";
-
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buffer += decoder.decode(value, { stream: true });
-  let sep;
-  while ((sep = buffer.indexOf("\n\n")) !== -1) {
-    const frame = buffer.slice(0, sep);
-    buffer = buffer.slice(sep + 2);
-    handleFrame(frame); // event: "step" → onStep(...) ; event: "state" → finalState
-  }
-}
-```
-
-**Front-end: state encoded for accessibility, not just colour.** Each concept shows its per-level mastery as a small glyph whose *shape* carries the meaning, so it stays legible for colourblind readers and reads faster at a glance.
-
-```typescript
-// mastered = check, in progress = half-filled, not started = outline
-function LevelStateGlyph({ bucket }: { bucket: LevelBucket }) {
-  const color = BUCKET_BAR[bucket];
-  if (bucket === "solid")
-    return <span style={{ ...base, background: color }}>✓</span>;
-  if (bucket === "shaky")
-    return <span style={{ ...base, border: `1.5px solid ${color}`,
-      background: `linear-gradient(90deg, ${color} 50%, transparent 50%)` }} />;
-  return <span style={{ ...base, border: `1.5px solid ${color}` }} />;
-}
-```
-
-**Back-end: privacy enforced by a type, not a rule.** The two insight features that genuinely need text return this dataclass. It has no student field, so an identity can't cross the boundary even by accident.
-
-```python
-@dataclass(frozen=True)
-class ActiveIssue:
-    """One student's current diagnosis at one concept, identity-stripped by
-    construction: the dataclass has no student field, so a student id cannot
-    cross this boundary even by accident."""
-    concept_id: str
-    level: str
-    analysis: str | None
-    misconception: str | None
-```
-
-More (the LangGraph wiring, the bucket logic, the aggregate-only repository, the SSE relay) is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## The lecturer surface
 
