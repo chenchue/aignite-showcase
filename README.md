@@ -86,7 +86,7 @@ A class metrics board (per-concept buckets, who's stuck, what's decayed, what's 
 |---|---|
 | **Front-end** | React, TypeScript, Vite, [@xyflow/react](https://reactflow.dev/) for the concept map |
 | **Back-end** | Python, FastAPI, LangGraph, Anthropic Claude, SQLAlchemy / SQLite, argon2 + JWT, Server-Sent Events |
-| **Quality** | the deterministic logic (mastery, scheduler, planner, repositories, graph routing) is covered by a `pytest` suite that runs offline against a stubbed LLM (~2,400 lines across 19 files); live LLM behaviour is pinned by golden eval suites |
+| **Quality** | the deterministic logic (mastery, scheduler, planner, repositories, graph routing) is covered by a `pytest` suite that runs offline against a stubbed LLM; live LLM behaviour is pinned by golden eval suites |
 
 ## What's in this repo
 
